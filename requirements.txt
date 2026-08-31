@@ -1,0 +1,6 @@
+streamlit
+streamlit-agraph
+networkx
+supabase
+atproto
+requests
