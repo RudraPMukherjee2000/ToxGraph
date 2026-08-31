@@ -3,8 +3,7 @@ import networkx as nx
 from streamlit_agraph import agraph, Node, Edge, Config
 from supabase import create_client
 from atproto import Client as BskyClient
-import requests
-import time
+from transformers import pipeline
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="ToxGraph | Focal Structure Analysis", layout="wide")
@@ -19,7 +18,7 @@ if 'graph_edges' not in st.session_state:
 if 'has_data' not in st.session_state:
     st.session_state.has_data = False
 
-# --- 1. CLIENT INITIALIZATION ---
+# --- 1. INITIALIZE CLIENTS & LOCAL MODEL ---
 @st.cache_resource
 def init_supabase():
     url = st.secrets["SUPABASE_URL"]
@@ -32,73 +31,39 @@ def init_bsky_client():
     client.login(st.secrets["BLUESKY_HANDLE"], st.secrets["BLUESKY_PASSWORD"])
     return client
 
+@st.cache_resource
+def load_toxicity_pipeline():
+    # Downloads model to local memory cache once (fast, zero HTTP timeouts)
+    return pipeline("text-classification", model="unitary/toxic-bert", top_k=None)
+
 supabase = init_supabase()
 bsky_client = init_bsky_client()
+tox_classifier = load_toxicity_pipeline()
 
-# --- 2. FAIL-FAST MULTI-LABEL TOXICITY INFERENCE ---
-def score_toxicity_batch(texts: list[str]) -> list[dict]:
-    """
-    Sends batch inference requests to Hugging Face.
-    Evaluates multilabel risks (toxic, identity_hate, insult, severe_toxic, threat).
-    """
+# --- 2. LOCAL INFERENCE ENGINE ---
+def score_texts_locally(texts: list[str]) -> list[dict]:
     if not texts:
         return []
-
-    headers = {"Authorization": f"Bearer {st.secrets['HF_TOKEN']}"}
-    url = "https://router.huggingface.co/hf-inference/models/unitary/toxic-bert"
-    payload = {"inputs": [t[:512] for t in texts]}
     
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=20)
-            
-            # Handle model cold-start
-            if response.status_code == 503:
-                wait_time = response.json().get("estimated_time", 10.0)
-                st.toast(f"Model cold-starting. Retrying in {int(wait_time)}s...", icon="⏳")
-                time.sleep(min(wait_time, 15.0))
-                continue
-                
-            if response.status_code == 429:
-                st.error("Hugging Face API Rate Limit Exceeded.")
-                st.stop()
-                
-            if response.status_code != 200:
-                st.error(f"HF Inference Error ({response.status_code}): {response.text}")
-                st.stop()
-                
-            result = response.json()
-            
-            # Normalize batch response to extract aggregate toxicity and top category
-            scored_batch = []
-            for item in result:
-                if isinstance(item, list):
-                    scores = {label_obj['label']: round(label_obj['score'], 4) for label_obj in item}
-                    # Aggregate highest risk indicator (catches slurs under identity_hate/insult)
-                    top_score = max(scores.values()) if scores else 0.0
-                    top_label = max(scores, key=scores.get) if scores else "unknown"
-                    scored_batch.append({
-                        "max_score": top_score,
-                        "primary_flag": top_label,
-                        "breakdown": scores
-                    })
-                else:
-                    scored_batch.append({"max_score": 0.0, "primary_flag": "error", "breakdown": {}})
-            return scored_batch
-
-        except requests.exceptions.RequestException as e:
-            if attempt == max_retries - 1:
-                st.error(f"Inference Connection Failure: {str(e)}")
-                st.stop()
-            time.sleep(2)
-            
-    return [{"max_score": 0.0, "primary_flag": "timeout", "breakdown": {}} for _ in texts]
+    # Process texts via local PyTorch inference
+    predictions = tox_classifier(texts, truncation=True, max_length=512)
+    
+    results = []
+    for item in predictions:
+        scores = {entry['label']: round(entry['score'], 4) for entry in item}
+        top_score = max(scores.values()) if scores else 0.0
+        top_label = max(scores, key=scores.get) if scores else "unknown"
+        results.append({
+            "max_score": top_score,
+            "primary_flag": top_label,
+            "breakdown": scores
+        })
+    return results
 
 # --- 3. SIDEBAR & UI ---
 st.sidebar.title("ToxGraph 🕸️")
 st.sidebar.markdown("### Focal Structure Analysis")
-st.sidebar.markdown("Queries the Bluesky AT Protocol, computes multi-label toxicity vectors via remote BERT inference, and models network amplification dynamics.")
+st.sidebar.markdown("Queries the Bluesky AT Protocol, computes multi-label toxicity vectors via local BERT inference, and models network amplification dynamics.")
 
 st.title("Discourse Velocity & Toxicity Tracker")
 search_query = st.text_input("Enter Target Keyword or Hashtag (e.g., 'india', '#politics')", "")
@@ -108,7 +73,7 @@ if st.button("Analyze Discourse", type="primary"):
     if not search_query.strip():
         st.warning("Please enter a valid keyword.")
     else:
-        with st.spinner("Fetching network data from Bluesky and scoring toxicity..."):
+        with st.spinner("Fetching Bluesky posts and running local BERT inference..."):
             try:
                 response = bsky_client.app.bsky.feed.search_posts(
                     params={'q': search_query, 'limit': 30, 'lang': 'en'}
@@ -125,7 +90,6 @@ if st.button("Analyze Discourse", type="primary"):
                 G = nx.DiGraph()
                 st.session_state.node_data.clear()
                 
-                # Extract text for batch inference
                 valid_posts = []
                 texts_to_score = []
                 for item in posts_data:
@@ -134,10 +98,9 @@ if st.button("Analyze Discourse", type="primary"):
                         valid_posts.append(item)
                         texts_to_score.append(text)
                 
-                # Execute batch scoring
-                inference_results = score_toxicity_batch(texts_to_score)
+                # Execute local multi-label classification
+                inference_results = score_texts_locally(texts_to_score)
                 
-                # Build graph nodes and relationships
                 for item, score_data in zip(valid_posts, inference_results):
                     author_data = item.author
                     record = item.record
@@ -158,7 +121,6 @@ if st.button("Analyze Discourse", type="primary"):
                         "type": "source"
                     }
                     
-                    # Severe/High Risk = Red, Medium = Orange, Clean = Blue
                     if tox_score > 0.7:
                         node_color = "#ff4b4b"
                     elif tox_score > 0.4:
@@ -168,7 +130,6 @@ if st.button("Analyze Discourse", type="primary"):
                         
                     G.add_node(author_did, label=author_handle, color=node_color, size=20)
                     
-                    # Parse parent reply references
                     reply_attr = getattr(record, 'reply', None)
                     parent_uri = getattr(reply_attr.parent, 'uri', None) if reply_attr and hasattr(reply_attr, 'parent') else None
                     
@@ -179,7 +140,7 @@ if st.button("Analyze Discourse", type="primary"):
                             G.add_edge(author_did, target_did)
                             
                             if target_did not in G:
-                                G.add_node(target_did, label=f"Target ({target_did[:12]}...)", color="#888888", size=15)
+                                G.add_node(target_did, label=f"Target ({target_did[:10]}...)", color="#888888", size=15)
                                 st.session_state.node_data[target_did] = {
                                     "handle": target_did,
                                     "text": "[Target account reference - original parent post not in current search window]",
@@ -189,7 +150,6 @@ if st.button("Analyze Discourse", type="primary"):
                                     "type": "target"
                                 }
                     
-                    # Persist metadata to Supabase
                     try:
                         supabase.table('authors').upsert({"did": author_did, "handle": author_handle}).execute()
                         supabase.table('posts').upsert({
@@ -204,7 +164,6 @@ if st.button("Analyze Discourse", type="primary"):
                     except Exception as db_err:
                         st.sidebar.warning(f"Database sync warning: {str(db_err)}")
                 
-                # Topological math for node sizing
                 if len(G.nodes()) > 0:
                     centrality = nx.degree_centrality(G)
                     st.session_state.graph_nodes = []
