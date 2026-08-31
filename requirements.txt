@@ -1,5 +1,8 @@
 streamlit
+networkx
 streamlit-agraph
 supabase
 atproto
 requests
+transformers
+torch
