@@ -45,7 +45,7 @@ def score_toxicity_batch(texts: list[str]) -> list[dict]:
         return []
 
     headers = {"Authorization": f"Bearer {st.secrets['HF_TOKEN']}"}
-    url = "https://api-inference.huggingface.co/models/unitary/toxic-bert"
+    url = "https://router.huggingface.co/hf-inference/models/unitary/toxic-bert"
     payload = {"inputs": [t[:512] for t in texts]}
     
     max_retries = 3
